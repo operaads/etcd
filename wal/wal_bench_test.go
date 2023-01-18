@@ -1,3 +1,17 @@
+// Copyright 2015 The etcd Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package wal
 
 import (
@@ -5,7 +19,9 @@ import (
 	"os"
 	"testing"
 
-	"github.com/coreos/etcd/raft/raftpb"
+	"go.uber.org/zap"
+
+	"go.etcd.io/etcd/raft/raftpb"
 )
 
 func BenchmarkWrite100EntryWithoutBatch(b *testing.B) { benchmarkWriteEntry(b, 100, 0) }
@@ -27,20 +43,21 @@ func benchmarkWriteEntry(b *testing.B, size int, batch int) {
 	}
 	defer os.RemoveAll(p)
 
-	w, err := Create(p, []byte("somedata"))
+	w, err := Create(zap.NewExample(), p, []byte("somedata"))
 	if err != nil {
 		b.Fatalf("err = %v, want nil", err)
 	}
 	data := make([]byte, size)
-	for i := 0; i < len(data); i++ {
+	for i := 0; i < size; i++ {
 		data[i] = byte(i)
 	}
 	e := &raftpb.Entry{Data: data}
 
 	b.ResetTimer()
 	n := 0
+	b.SetBytes(int64(e.Size()))
 	for i := 0; i < b.N; i++ {
-		err := w.SaveEntry(e)
+		err := w.saveEntry(e)
 		if err != nil {
 			b.Fatal(err)
 		}

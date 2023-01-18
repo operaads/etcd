@@ -1,70 +1,34 @@
-/*
-   Copyright 2014 CoreOS, Inc.
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-*/
+// Copyright 2015 The etcd Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package wal
 
 import (
+	"errors"
 	"fmt"
-	"log"
-	"os"
-	"path"
+	"strings"
 
-	"github.com/coreos/etcd/pkg/fileutil"
-	"github.com/coreos/etcd/pkg/types"
+	"go.etcd.io/etcd/pkg/fileutil"
+
+	"go.uber.org/zap"
 )
 
-// WalVersion is an enum for versions of etcd logs.
-type WalVersion string
+var errBadWALName = errors.New("bad wal name")
 
-const (
-	WALUnknown  WalVersion = "Unknown WAL"
-	WALNotExist WalVersion = "No WAL"
-	WALv0_4     WalVersion = "0.4.x"
-	WALv0_5     WalVersion = "0.5.x"
-)
-
-func DetectVersion(dirpath string) (WalVersion, error) {
-	if _, err := os.Stat(dirpath); os.IsNotExist(err) {
-		return WALNotExist, nil
-	}
-	names, err := fileutil.ReadDir(dirpath)
-	if err != nil {
-		// Error reading the directory
-		return WALNotExist, err
-	}
-	if len(names) == 0 {
-		// Empty WAL directory
-		return WALNotExist, nil
-	}
-	nameSet := types.NewUnsafeSet(names...)
-	if nameSet.ContainsAll([]string{"snap", "wal"}) {
-		// .../wal cannot be empty to exist.
-		if Exist(path.Join(dirpath, "wal")) {
-			return WALv0_5, nil
-		}
-	}
-	if nameSet.ContainsAll([]string{"snapshot", "conf", "log"}) {
-		return WALv0_4, nil
-	}
-
-	return WALUnknown, nil
-}
-
-func Exist(dirpath string) bool {
-	names, err := fileutil.ReadDir(dirpath)
+// Exist returns true if there are any files in a given directory.
+func Exist(dir string) bool {
+	names, err := fileutil.ReadDir(dir, fileutil.WithExt(".wal"))
 	if err != nil {
 		return false
 	}
@@ -74,12 +38,16 @@ func Exist(dirpath string) bool {
 // searchIndex returns the last array index of names whose raft index section is
 // equal to or smaller than the given index.
 // The given names MUST be sorted.
-func searchIndex(names []string, index uint64) (int, bool) {
+func searchIndex(lg *zap.Logger, names []string, index uint64) (int, bool) {
 	for i := len(names) - 1; i >= 0; i-- {
 		name := names[i]
-		_, curIndex, err := parseWalName(name)
+		_, curIndex, err := parseWALName(name)
 		if err != nil {
-			log.Panicf("parse correct name should never fail: %v", err)
+			if lg != nil {
+				lg.Panic("failed to parse WAL file name", zap.String("path", name), zap.Error(err))
+			} else {
+				plog.Panicf("parse correct name should never fail: %v", err)
+			}
 		}
 		if index >= curIndex {
 			return i, true
@@ -90,12 +58,16 @@ func searchIndex(names []string, index uint64) (int, bool) {
 
 // names should have been sorted based on sequence number.
 // isValidSeq checks whether seq increases continuously.
-func isValidSeq(names []string) bool {
+func isValidSeq(lg *zap.Logger, names []string) bool {
 	var lastSeq uint64
 	for _, name := range names {
-		curSeq, _, err := parseWalName(name)
+		curSeq, _, err := parseWALName(name)
 		if err != nil {
-			log.Panicf("parse correct name should never fail: %v", err)
+			if lg != nil {
+				lg.Panic("failed to parse WAL file name", zap.String("path", name), zap.Error(err))
+			} else {
+				plog.Panicf("parse correct name should never fail: %v", err)
+			}
 		}
 		if lastSeq != 0 && lastSeq != curSeq-1 {
 			return false
@@ -105,11 +77,33 @@ func isValidSeq(names []string) bool {
 	return true
 }
 
-func checkWalNames(names []string) []string {
+func readWALNames(lg *zap.Logger, dirpath string) ([]string, error) {
+	names, err := fileutil.ReadDir(dirpath)
+	if err != nil {
+		return nil, err
+	}
+	wnames := checkWalNames(lg, names)
+	if len(wnames) == 0 {
+		return nil, ErrFileNotFound
+	}
+	return wnames, nil
+}
+
+func checkWalNames(lg *zap.Logger, names []string) []string {
 	wnames := make([]string, 0)
 	for _, name := range names {
-		if _, _, err := parseWalName(name); err != nil {
-			log.Printf("wal: parse %s error: %v", name, err)
+		if _, _, err := parseWALName(name); err != nil {
+			// don't complain about left over tmp files
+			if !strings.HasSuffix(name, ".tmp") {
+				if lg != nil {
+					lg.Warn(
+						"ignored file in WAL directory",
+						zap.String("path", name),
+					)
+				} else {
+					plog.Warningf("ignored file %v in wal", name)
+				}
+			}
 			continue
 		}
 		wnames = append(wnames, name)
@@ -117,22 +111,14 @@ func checkWalNames(names []string) []string {
 	return wnames
 }
 
-func parseWalName(str string) (seq, index uint64, err error) {
-	var num int
-	num, err = fmt.Sscanf(str, "%016x-%016x.wal", &seq, &index)
-	if num != 2 && err == nil {
-		err = fmt.Errorf("bad wal name: %s", str)
+func parseWALName(str string) (seq, index uint64, err error) {
+	if !strings.HasSuffix(str, ".wal") {
+		return 0, 0, errBadWALName
 	}
-	return
+	_, err = fmt.Sscanf(str, "%016x-%016x.wal", &seq, &index)
+	return seq, index, err
 }
 
 func walName(seq, index uint64) string {
 	return fmt.Sprintf("%016x-%016x.wal", seq, index)
-}
-
-func max(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
 }

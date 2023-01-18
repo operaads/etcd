@@ -1,18 +1,16 @@
-/*
-   Copyright 2014 CoreOS, Inc.
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-*/
+// Copyright 2015 The etcd Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package raft
 
@@ -20,7 +18,7 @@ import (
 	"reflect"
 	"testing"
 
-	pb "github.com/coreos/etcd/raft/raftpb"
+	pb "go.etcd.io/etcd/raft/raftpb"
 )
 
 func TestUnstableMaybeFirstIndex(t *testing.T) {
@@ -57,6 +55,7 @@ func TestUnstableMaybeFirstIndex(t *testing.T) {
 			entries:  tt.entries,
 			offset:   tt.offset,
 			snapshot: tt.snap,
+			logger:   raftLogger,
 		}
 		index, ok := u.maybeFirstIndex()
 		if ok != tt.wok {
@@ -103,6 +102,7 @@ func TestMaybeLastIndex(t *testing.T) {
 			entries:  tt.entries,
 			offset:   tt.offset,
 			snapshot: tt.snap,
+			logger:   raftLogger,
 		}
 		index, ok := u.maybeLastIndex()
 		if ok != tt.wok {
@@ -157,6 +157,11 @@ func TestUnstableMaybeTerm(t *testing.T) {
 			true, 1,
 		},
 		{
+			[]pb.Entry{{Index: 5, Term: 1}}, 5, &pb.Snapshot{Metadata: pb.SnapshotMetadata{Index: 4, Term: 1}},
+			3,
+			false, 0,
+		},
+		{
 			[]pb.Entry{}, 5, &pb.Snapshot{Metadata: pb.SnapshotMetadata{Index: 4, Term: 1}},
 			5,
 			false, 0,
@@ -178,6 +183,7 @@ func TestUnstableMaybeTerm(t *testing.T) {
 			entries:  tt.entries,
 			offset:   tt.offset,
 			snapshot: tt.snap,
+			logger:   raftLogger,
 		}
 		term, ok := u.maybeTerm(tt.index)
 		if ok != tt.wok {
@@ -194,6 +200,7 @@ func TestUnstableRestore(t *testing.T) {
 		entries:  []pb.Entry{{Index: 5, Term: 1}},
 		offset:   5,
 		snapshot: &pb.Snapshot{Metadata: pb.SnapshotMetadata{Index: 4, Term: 1}},
+		logger:   raftLogger,
 	}
 	s := pb.Snapshot{Metadata: pb.SnapshotMetadata{Index: 6, Term: 2}}
 	u.restore(s)
@@ -235,9 +242,9 @@ func TestUnstableStableTo(t *testing.T) {
 			6, 1,
 		},
 		{
-			[]pb.Entry{{Index: 6, Term: 2}}, 5, nil,
+			[]pb.Entry{{Index: 6, Term: 2}}, 6, nil,
 			6, 1, // stable to the first entry and term mismatch
-			5, 1,
+			6, 1,
 		},
 		{
 			[]pb.Entry{{Index: 5, Term: 1}}, 5, nil,
@@ -261,9 +268,9 @@ func TestUnstableStableTo(t *testing.T) {
 			6, 1,
 		},
 		{
-			[]pb.Entry{{Index: 6, Term: 2}}, 5, &pb.Snapshot{Metadata: pb.SnapshotMetadata{Index: 5, Term: 1}},
+			[]pb.Entry{{Index: 6, Term: 2}}, 6, &pb.Snapshot{Metadata: pb.SnapshotMetadata{Index: 5, Term: 1}},
 			6, 1, // stable to the first entry and term mismatch
-			5, 1,
+			6, 1,
 		},
 		{
 			[]pb.Entry{{Index: 5, Term: 1}}, 5, &pb.Snapshot{Metadata: pb.SnapshotMetadata{Index: 4, Term: 1}},
@@ -282,6 +289,7 @@ func TestUnstableStableTo(t *testing.T) {
 			entries:  tt.entries,
 			offset:   tt.offset,
 			snapshot: tt.snap,
+			logger:   raftLogger,
 		}
 		u.stableTo(tt.index, tt.term)
 		if u.offset != tt.woffset {
@@ -338,6 +346,7 @@ func TestUnstableTruncateAndAppend(t *testing.T) {
 			entries:  tt.entries,
 			offset:   tt.offset,
 			snapshot: tt.snap,
+			logger:   raftLogger,
 		}
 		u.truncateAndAppend(tt.toappend)
 		if u.offset != tt.woffset {

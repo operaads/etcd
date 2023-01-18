@@ -1,18 +1,16 @@
-/*
-   Copyright 2014 CoreOS, Inc.
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-*/
+// Copyright 2015 The etcd Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package types
 
@@ -161,6 +159,28 @@ func driveSetTests(t *testing.T, s Set) {
 	} {
 		if !equal(tt.want, tt.got) {
 			t.Fatalf("case %d: expect values=%v got %v", i, tt.want, tt.got)
+		}
+	}
+}
+
+func TestUnsafeSetContainsAll(t *testing.T) {
+	vals := []string{"foo", "bar", "baz"}
+	s := NewUnsafeSet(vals...)
+
+	tests := []struct {
+		strs     []string
+		wcontain bool
+	}{
+		{[]string{}, true},
+		{vals[:1], true},
+		{vals[:2], true},
+		{vals, true},
+		{[]string{"cuz"}, false},
+		{[]string{vals[0], "cuz"}, false},
+	}
+	for i, tt := range tests {
+		if g := s.ContainsAll(tt.strs); g != tt.wcontain {
+			t.Errorf("#%d: ok = %v, want %v", i, g, tt.wcontain)
 		}
 	}
 }

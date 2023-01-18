@@ -1,60 +1,46 @@
-/*
-   Copyright 2014 CoreOS, Inc.
+// Copyright 2016 The etcd Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-*/
-
+// etcdctl is a command line application that controls etcd.
 package main
 
 import (
+	"fmt"
 	"os"
 
-	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/codegangsta/cli"
+	"go.etcd.io/etcd/etcdctl/ctlv2"
+	"go.etcd.io/etcd/etcdctl/ctlv3"
+)
 
-	"github.com/coreos/etcd/etcdctl/command"
-	"github.com/coreos/etcd/version"
+const (
+	apiEnv = "ETCDCTL_API"
 )
 
 func main() {
-	app := cli.NewApp()
-	app.Name = "etcdctl"
-	app.Version = version.Version
-	app.Usage = "A simple command line client for etcd."
-	app.Flags = []cli.Flag{
-		cli.BoolFlag{Name: "debug", Usage: "output cURL commands which can be used to reproduce the request"},
-		cli.BoolFlag{Name: "no-sync", Usage: "don't synchronize cluster information before sending request"},
-		cli.StringFlag{Name: "output, o", Value: "simple", Usage: "output response in the given format (`simple` or `json`)"},
-		cli.StringFlag{Name: "peers, C", Value: "", Usage: "a comma-delimited list of machine addresses in the cluster (default: \"127.0.0.1:4001\")"},
-		cli.StringFlag{Name: "cert-file", Value: "", Usage: "identify HTTPS client using this SSL certificate file"},
-		cli.StringFlag{Name: "key-file", Value: "", Usage: "identify HTTPS client using this SSL key file"},
-		cli.StringFlag{Name: "ca-file", Value: "", Usage: "verify certificates of HTTPS-enabled servers using this CA bundle"},
-	}
-	app.Commands = []cli.Command{
-		command.NewBackupCommand(),
-		command.NewMakeCommand(),
-		command.NewMakeDirCommand(),
-		command.NewRemoveCommand(),
-		command.NewRemoveDirCommand(),
-		command.NewGetCommand(),
-		command.NewLsCommand(),
-		command.NewSetCommand(),
-		command.NewSetDirCommand(),
-		command.NewUpdateCommand(),
-		command.NewUpdateDirCommand(),
-		command.NewWatchCommand(),
-		command.NewExecWatchCommand(),
-		command.NewMemberCommand(),
+	apiv := os.Getenv(apiEnv)
+	// unset apiEnv to avoid side-effect for future env and flag parsing.
+	os.Unsetenv(apiEnv)
+	if len(apiv) == 0 || apiv == "3" {
+		ctlv3.Start()
+		return
 	}
 
-	app.Run(os.Args)
+	if apiv == "2" {
+		ctlv2.Start()
+		return
+	}
+
+	fmt.Fprintln(os.Stderr, "unsupported API version", apiv)
+	os.Exit(1)
 }

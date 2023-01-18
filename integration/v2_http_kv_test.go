@@ -1,18 +1,16 @@
-/*
-   Copyright 2014 CoreOS, Inc.
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-*/
+// Copyright 2015 The etcd Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package integration
 
@@ -21,21 +19,19 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"go.etcd.io/etcd/pkg/testutil"
+	"go.etcd.io/etcd/pkg/transport"
 )
 
-func init() {
-	log.SetOutput(ioutil.Discard)
-}
-
 func TestV2Set(t *testing.T) {
+	defer testutil.AfterTest(t)
 	cl := NewCluster(t, 1)
 	cl.Launch(t)
 	defer cl.Terminate(t)
@@ -44,6 +40,9 @@ func TestV2Set(t *testing.T) {
 	tc := NewTestClient()
 	v := url.Values{}
 	v.Set("value", "bar")
+	vAndNoValue := url.Values{}
+	vAndNoValue.Set("value", "bar")
+	vAndNoValue.Set("noValueOnSuccess", "true")
 
 	tests := []struct {
 		relativeURL string
@@ -55,19 +54,25 @@ func TestV2Set(t *testing.T) {
 			"/v2/keys/foo/bar",
 			v,
 			http.StatusCreated,
-			`{"action":"set","node":{"key":"/foo/bar","value":"bar","modifiedIndex":3,"createdIndex":3}}`,
+			`{"action":"set","node":{"key":"/foo/bar","value":"bar","modifiedIndex":4,"createdIndex":4}}`,
 		},
 		{
 			"/v2/keys/foodir?dir=true",
 			url.Values{},
 			http.StatusCreated,
-			`{"action":"set","node":{"key":"/foodir","dir":true,"modifiedIndex":4,"createdIndex":4}}`,
+			`{"action":"set","node":{"key":"/foodir","dir":true,"modifiedIndex":5,"createdIndex":5}}`,
 		},
 		{
 			"/v2/keys/fooempty",
 			url.Values(map[string][]string{"value": {""}}),
 			http.StatusCreated,
-			`{"action":"set","node":{"key":"/fooempty","value":"","modifiedIndex":5,"createdIndex":5}}`,
+			`{"action":"set","node":{"key":"/fooempty","value":"","modifiedIndex":6,"createdIndex":6}}`,
+		},
+		{
+			"/v2/keys/foo/novalue",
+			vAndNoValue,
+			http.StatusCreated,
+			`{"action":"set"}`,
 		},
 	}
 
@@ -88,6 +93,7 @@ func TestV2Set(t *testing.T) {
 }
 
 func TestV2CreateUpdate(t *testing.T) {
+	defer testutil.AfterTest(t)
 	cl := NewCluster(t, 1)
 	cl.Launch(t)
 	defer cl.Terminate(t)
@@ -181,10 +187,38 @@ func TestV2CreateUpdate(t *testing.T) {
 				"cause":     "/nonexist",
 			},
 		},
+		// create with no value on success
+		{
+			"/v2/keys/create/novalue",
+			url.Values(map[string][]string{"value": {"XXX"}, "prevExist": {"false"}, "noValueOnSuccess": {"true"}}),
+			http.StatusCreated,
+			map[string]interface{}{},
+		},
+		// update with no value on success
+		{
+			"/v2/keys/create/novalue",
+			url.Values(map[string][]string{"value": {"XXX"}, "prevExist": {"true"}, "noValueOnSuccess": {"true"}}),
+			http.StatusOK,
+			map[string]interface{}{},
+		},
+		// created key failed with no value on success
+		{
+			"/v2/keys/create/foo",
+			url.Values(map[string][]string{"value": {"XXX"}, "prevExist": {"false"}, "noValueOnSuccess": {"true"}}),
+			http.StatusPreconditionFailed,
+			map[string]interface{}{
+				"errorCode": float64(105),
+				"message":   "Key already exists",
+				"cause":     "/create/foo",
+			},
+		},
 	}
 
 	for i, tt := range tests {
-		resp, _ := tc.PutForm(fmt.Sprintf("%s%s", u, tt.relativeURL), tt.value)
+		resp, err := tc.PutForm(fmt.Sprintf("%s%s", u, tt.relativeURL), tt.value)
+		if err != nil {
+			t.Fatalf("#%d: put err = %v, want nil", i, err)
+		}
 		if resp.StatusCode != tt.wStatus {
 			t.Errorf("#%d: status = %d, want %d", i, resp.StatusCode, tt.wStatus)
 		}
@@ -195,6 +229,7 @@ func TestV2CreateUpdate(t *testing.T) {
 }
 
 func TestV2CAS(t *testing.T) {
+	defer testutil.AfterTest(t)
 	cl := NewCluster(t, 1)
 	cl.Launch(t)
 	defer cl.Terminate(t)
@@ -216,12 +251,12 @@ func TestV2CAS(t *testing.T) {
 		},
 		{
 			"/v2/keys/cas/foo",
-			url.Values(map[string][]string{"value": {"YYY"}, "prevIndex": {"3"}}),
+			url.Values(map[string][]string{"value": {"YYY"}, "prevIndex": {"4"}}),
 			http.StatusOK,
 			map[string]interface{}{
 				"node": map[string]interface{}{
 					"value":         "YYY",
-					"modifiedIndex": float64(4),
+					"modifiedIndex": float64(5),
 				},
 				"action": "compareAndSwap",
 			},
@@ -233,8 +268,8 @@ func TestV2CAS(t *testing.T) {
 			map[string]interface{}{
 				"errorCode": float64(101),
 				"message":   "Compare failed",
-				"cause":     "[10 != 4]",
-				"index":     float64(4),
+				"cause":     "[10 != 5]",
+				"index":     float64(5),
 			},
 		},
 		{
@@ -283,7 +318,7 @@ func TestV2CAS(t *testing.T) {
 			map[string]interface{}{
 				"errorCode": float64(101),
 				"message":   "Compare failed",
-				"cause":     "[bad_value != ZZZ] [100 != 5]",
+				"cause":     "[bad_value != ZZZ] [100 != 6]",
 			},
 		},
 		{
@@ -293,12 +328,12 @@ func TestV2CAS(t *testing.T) {
 			map[string]interface{}{
 				"errorCode": float64(101),
 				"message":   "Compare failed",
-				"cause":     "[100 != 5]",
+				"cause":     "[100 != 6]",
 			},
 		},
 		{
 			"/v2/keys/cas/foo",
-			url.Values(map[string][]string{"value": {"XXX"}, "prevValue": {"bad_value"}, "prevIndex": {"5"}}),
+			url.Values(map[string][]string{"value": {"XXX"}, "prevValue": {"bad_value"}, "prevIndex": {"6"}}),
 			http.StatusPreconditionFailed,
 			map[string]interface{}{
 				"errorCode": float64(101),
@@ -306,10 +341,32 @@ func TestV2CAS(t *testing.T) {
 				"cause":     "[bad_value != ZZZ]",
 			},
 		},
+		{
+			"/v2/keys/cas/foo",
+			url.Values(map[string][]string{"value": {"YYY"}, "prevIndex": {"6"}, "noValueOnSuccess": {"true"}}),
+			http.StatusOK,
+			map[string]interface{}{
+				"action": "compareAndSwap",
+			},
+		},
+		{
+			"/v2/keys/cas/foo",
+			url.Values(map[string][]string{"value": {"YYY"}, "prevIndex": {"10"}, "noValueOnSuccess": {"true"}}),
+			http.StatusPreconditionFailed,
+			map[string]interface{}{
+				"errorCode": float64(101),
+				"message":   "Compare failed",
+				"cause":     "[10 != 7]",
+				"index":     float64(7),
+			},
+		},
 	}
 
 	for i, tt := range tests {
-		resp, _ := tc.PutForm(fmt.Sprintf("%s%s", u, tt.relativeURL), tt.value)
+		resp, err := tc.PutForm(fmt.Sprintf("%s%s", u, tt.relativeURL), tt.value)
+		if err != nil {
+			t.Fatalf("#%d: put err = %v, want nil", i, err)
+		}
 		if resp.StatusCode != tt.wStatus {
 			t.Errorf("#%d: status = %d, want %d", i, resp.StatusCode, tt.wStatus)
 		}
@@ -320,6 +377,7 @@ func TestV2CAS(t *testing.T) {
 }
 
 func TestV2Delete(t *testing.T) {
+	defer testutil.AfterTest(t)
 	cl := NewCluster(t, 1)
 	cl.Launch(t)
 	defer cl.Terminate(t)
@@ -329,21 +387,21 @@ func TestV2Delete(t *testing.T) {
 
 	v := url.Values{}
 	v.Set("value", "XXX")
-	resp, err := tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/foo"), v)
+	r, err := tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/foo"), v)
 	if err != nil {
 		t.Error(err)
 	}
-	resp.Body.Close()
-	resp, err = tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/emptydir?dir=true"), v)
+	r.Body.Close()
+	r, err = tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/emptydir?dir=true"), v)
 	if err != nil {
 		t.Error(err)
 	}
-	resp.Body.Close()
-	resp, err = tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/foodir/bar?dir=true"), v)
+	r.Body.Close()
+	r, err = tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/foodir/bar?dir=true"), v)
 	if err != nil {
 		t.Error(err)
 	}
-	resp.Body.Close()
+	r.Body.Close()
 
 	tests := []struct {
 		relativeURL string
@@ -405,7 +463,10 @@ func TestV2Delete(t *testing.T) {
 	}
 
 	for i, tt := range tests {
-		resp, _ := tc.DeleteForm(fmt.Sprintf("%s%s", u, tt.relativeURL), nil)
+		resp, err := tc.DeleteForm(fmt.Sprintf("%s%s", u, tt.relativeURL), nil)
+		if err != nil {
+			t.Fatalf("#%d: delete err = %v, want nil", i, err)
+		}
 		if resp.StatusCode != tt.wStatus {
 			t.Errorf("#%d: status = %d, want %d", i, resp.StatusCode, tt.wStatus)
 		}
@@ -416,6 +477,7 @@ func TestV2Delete(t *testing.T) {
 }
 
 func TestV2CAD(t *testing.T) {
+	defer testutil.AfterTest(t)
 	cl := NewCluster(t, 1)
 	cl.Launch(t)
 	defer cl.Terminate(t)
@@ -425,17 +487,17 @@ func TestV2CAD(t *testing.T) {
 
 	v := url.Values{}
 	v.Set("value", "XXX")
-	resp, err := tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/foo"), v)
+	r, err := tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/foo"), v)
 	if err != nil {
 		t.Error(err)
 	}
-	resp.Body.Close()
+	r.Body.Close()
 
-	resp, err = tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/foovalue"), v)
+	r, err = tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/foovalue"), v)
 	if err != nil {
 		t.Error(err)
 	}
-	resp.Body.Close()
+	r.Body.Close()
 
 	tests := []struct {
 		relativeURL string
@@ -448,7 +510,7 @@ func TestV2CAD(t *testing.T) {
 			map[string]interface{}{
 				"errorCode": float64(101),
 				"message":   "Compare failed",
-				"cause":     "[100 != 3]",
+				"cause":     "[100 != 4]",
 			},
 		},
 		{
@@ -460,12 +522,12 @@ func TestV2CAD(t *testing.T) {
 			},
 		},
 		{
-			"/v2/keys/foo?prevIndex=3",
+			"/v2/keys/foo?prevIndex=4",
 			http.StatusOK,
 			map[string]interface{}{
 				"node": map[string]interface{}{
 					"key":           "/foo",
-					"modifiedIndex": float64(5),
+					"modifiedIndex": float64(6),
 				},
 				"action": "compareAndDelete",
 			},
@@ -493,7 +555,7 @@ func TestV2CAD(t *testing.T) {
 			map[string]interface{}{
 				"node": map[string]interface{}{
 					"key":           "/foovalue",
-					"modifiedIndex": float64(6),
+					"modifiedIndex": float64(7),
 				},
 				"action": "compareAndDelete",
 			},
@@ -501,7 +563,10 @@ func TestV2CAD(t *testing.T) {
 	}
 
 	for i, tt := range tests {
-		resp, _ := tc.DeleteForm(fmt.Sprintf("%s%s", u, tt.relativeURL), nil)
+		resp, err := tc.DeleteForm(fmt.Sprintf("%s%s", u, tt.relativeURL), nil)
+		if err != nil {
+			t.Fatalf("#%d: delete err = %v, want nil", i, err)
+		}
 		if resp.StatusCode != tt.wStatus {
 			t.Errorf("#%d: status = %d, want %d", i, resp.StatusCode, tt.wStatus)
 		}
@@ -512,6 +577,7 @@ func TestV2CAD(t *testing.T) {
 }
 
 func TestV2Unique(t *testing.T) {
+	defer testutil.AfterTest(t)
 	cl := NewCluster(t, 1)
 	cl.Launch(t)
 	defer cl.Terminate(t)
@@ -531,7 +597,7 @@ func TestV2Unique(t *testing.T) {
 			http.StatusCreated,
 			map[string]interface{}{
 				"node": map[string]interface{}{
-					"key":   "/foo/3",
+					"key":   "/foo/00000000000000000004",
 					"value": "XXX",
 				},
 				"action": "create",
@@ -543,7 +609,7 @@ func TestV2Unique(t *testing.T) {
 			http.StatusCreated,
 			map[string]interface{}{
 				"node": map[string]interface{}{
-					"key":   "/foo/4",
+					"key":   "/foo/00000000000000000005",
 					"value": "XXX",
 				},
 				"action": "create",
@@ -555,7 +621,7 @@ func TestV2Unique(t *testing.T) {
 			http.StatusCreated,
 			map[string]interface{}{
 				"node": map[string]interface{}{
-					"key":   "/bar/5",
+					"key":   "/bar/00000000000000000006",
 					"value": "XXX",
 				},
 				"action": "create",
@@ -564,7 +630,10 @@ func TestV2Unique(t *testing.T) {
 	}
 
 	for i, tt := range tests {
-		resp, _ := tc.PostForm(fmt.Sprintf("%s%s", u, tt.relativeURL), tt.value)
+		resp, err := tc.PostForm(fmt.Sprintf("%s%s", u, tt.relativeURL), tt.value)
+		if err != nil {
+			t.Fatalf("#%d: post err = %v, want nil", i, err)
+		}
 		if resp.StatusCode != tt.wStatus {
 			t.Errorf("#%d: status = %d, want %d", i, resp.StatusCode, tt.wStatus)
 		}
@@ -575,6 +644,7 @@ func TestV2Unique(t *testing.T) {
 }
 
 func TestV2Get(t *testing.T) {
+	defer testutil.AfterTest(t)
 	cl := NewCluster(t, 1)
 	cl.Launch(t)
 	defer cl.Terminate(t)
@@ -584,11 +654,11 @@ func TestV2Get(t *testing.T) {
 
 	v := url.Values{}
 	v.Set("value", "XXX")
-	resp, err := tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/foo/bar/zar"), v)
+	r, err := tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/foo/bar/zar"), v)
 	if err != nil {
 		t.Error(err)
 	}
-	resp.Body.Close()
+	r.Body.Close()
 
 	tests := []struct {
 		relativeURL string
@@ -617,8 +687,8 @@ func TestV2Get(t *testing.T) {
 						map[string]interface{}{
 							"key":           "/foo/bar",
 							"dir":           true,
-							"createdIndex":  float64(3),
-							"modifiedIndex": float64(3),
+							"createdIndex":  float64(4),
+							"modifiedIndex": float64(4),
 						},
 					},
 				},
@@ -636,14 +706,14 @@ func TestV2Get(t *testing.T) {
 						map[string]interface{}{
 							"key":           "/foo/bar",
 							"dir":           true,
-							"createdIndex":  float64(3),
-							"modifiedIndex": float64(3),
+							"createdIndex":  float64(4),
+							"modifiedIndex": float64(4),
 							"nodes": []interface{}{
 								map[string]interface{}{
 									"key":           "/foo/bar/zar",
 									"value":         "XXX",
-									"createdIndex":  float64(3),
-									"modifiedIndex": float64(3),
+									"createdIndex":  float64(4),
+									"modifiedIndex": float64(4),
 								},
 							},
 						},
@@ -655,7 +725,10 @@ func TestV2Get(t *testing.T) {
 	}
 
 	for i, tt := range tests {
-		resp, _ := tc.Get(fmt.Sprintf("%s%s", u, tt.relativeURL))
+		resp, err := tc.Get(fmt.Sprintf("%s%s", u, tt.relativeURL))
+		if err != nil {
+			t.Fatalf("#%d: get err = %v, want nil", i, err)
+		}
 		if resp.StatusCode != tt.wStatus {
 			t.Errorf("#%d: status = %d, want %d", i, resp.StatusCode, tt.wStatus)
 		}
@@ -669,6 +742,7 @@ func TestV2Get(t *testing.T) {
 }
 
 func TestV2QuorumGet(t *testing.T) {
+	defer testutil.AfterTest(t)
 	cl := NewCluster(t, 1)
 	cl.Launch(t)
 	defer cl.Terminate(t)
@@ -678,11 +752,11 @@ func TestV2QuorumGet(t *testing.T) {
 
 	v := url.Values{}
 	v.Set("value", "XXX")
-	resp, err := tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/foo/bar/zar?quorum=true"), v)
+	r, err := tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/foo/bar/zar?quorum=true"), v)
 	if err != nil {
 		t.Error(err)
 	}
-	resp.Body.Close()
+	r.Body.Close()
 
 	tests := []struct {
 		relativeURL string
@@ -711,8 +785,8 @@ func TestV2QuorumGet(t *testing.T) {
 						map[string]interface{}{
 							"key":           "/foo/bar",
 							"dir":           true,
-							"createdIndex":  float64(3),
-							"modifiedIndex": float64(3),
+							"createdIndex":  float64(4),
+							"modifiedIndex": float64(4),
 						},
 					},
 				},
@@ -730,14 +804,14 @@ func TestV2QuorumGet(t *testing.T) {
 						map[string]interface{}{
 							"key":           "/foo/bar",
 							"dir":           true,
-							"createdIndex":  float64(3),
-							"modifiedIndex": float64(3),
+							"createdIndex":  float64(4),
+							"modifiedIndex": float64(4),
 							"nodes": []interface{}{
 								map[string]interface{}{
 									"key":           "/foo/bar/zar",
 									"value":         "XXX",
-									"createdIndex":  float64(3),
-									"modifiedIndex": float64(3),
+									"createdIndex":  float64(4),
+									"modifiedIndex": float64(4),
 								},
 							},
 						},
@@ -749,7 +823,10 @@ func TestV2QuorumGet(t *testing.T) {
 	}
 
 	for i, tt := range tests {
-		resp, _ := tc.Get(fmt.Sprintf("%s%s", u, tt.relativeURL))
+		resp, err := tc.Get(fmt.Sprintf("%s%s", u, tt.relativeURL))
+		if err != nil {
+			t.Fatalf("#%d: get err = %v, want nil", i, err)
+		}
 		if resp.StatusCode != tt.wStatus {
 			t.Errorf("#%d: status = %d, want %d", i, resp.StatusCode, tt.wStatus)
 		}
@@ -763,6 +840,7 @@ func TestV2QuorumGet(t *testing.T) {
 }
 
 func TestV2Watch(t *testing.T) {
+	defer testutil.AfterTest(t)
 	cl := NewCluster(t, 1)
 	cl.Launch(t)
 	defer cl.Terminate(t)
@@ -770,12 +848,18 @@ func TestV2Watch(t *testing.T) {
 	u := cl.URL(0)
 	tc := NewTestClient()
 
-	watchResp, _ := tc.Get(fmt.Sprintf("%s%s", u, "/v2/keys/foo/bar?wait=true"))
+	watchResp, err := tc.Get(fmt.Sprintf("%s%s", u, "/v2/keys/foo/bar?wait=true"))
+	if err != nil {
+		t.Fatalf("watch err = %v, want nil", err)
+	}
 
 	// Set a value.
 	v := url.Values{}
 	v.Set("value", "XXX")
-	resp, _ := tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/foo/bar"), v)
+	resp, err := tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/foo/bar"), v)
+	if err != nil {
+		t.Fatalf("put err = %v, want nil", err)
+	}
 	resp.Body.Close()
 
 	body := tc.ReadBodyJSON(watchResp)
@@ -783,7 +867,7 @@ func TestV2Watch(t *testing.T) {
 		"node": map[string]interface{}{
 			"key":           "/foo/bar",
 			"value":         "XXX",
-			"modifiedIndex": float64(3),
+			"modifiedIndex": float64(4),
 		},
 		"action": "set",
 	}
@@ -794,6 +878,7 @@ func TestV2Watch(t *testing.T) {
 }
 
 func TestV2WatchWithIndex(t *testing.T) {
+	defer testutil.AfterTest(t)
 	cl := NewCluster(t, 1)
 	cl.Launch(t)
 	defer cl.Terminate(t)
@@ -804,7 +889,10 @@ func TestV2WatchWithIndex(t *testing.T) {
 	var body map[string]interface{}
 	c := make(chan bool, 1)
 	go func() {
-		resp, _ := tc.Get(fmt.Sprintf("%s%s", u, "/v2/keys/foo/bar?wait=true&waitIndex=4"))
+		resp, err := tc.Get(fmt.Sprintf("%s%s", u, "/v2/keys/foo/bar?wait=true&waitIndex=5"))
+		if err != nil {
+			t.Errorf("watch err = %v, want nil", err)
+		}
 		body = tc.ReadBodyJSON(resp)
 		c <- true
 	}()
@@ -818,7 +906,10 @@ func TestV2WatchWithIndex(t *testing.T) {
 	// Set a value (before given index).
 	v := url.Values{}
 	v.Set("value", "XXX")
-	resp, _ := tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/foo/bar"), v)
+	resp, err := tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/foo/bar"), v)
+	if err != nil {
+		t.Fatalf("put err = %v, want nil", err)
+	}
 	resp.Body.Close()
 
 	select {
@@ -828,7 +919,10 @@ func TestV2WatchWithIndex(t *testing.T) {
 	}
 
 	// Set a value (before given index).
-	resp, _ = tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/foo/bar"), v)
+	resp, err = tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/foo/bar"), v)
+	if err != nil {
+		t.Fatalf("put err = %v, want nil", err)
+	}
 	resp.Body.Close()
 
 	select {
@@ -841,7 +935,7 @@ func TestV2WatchWithIndex(t *testing.T) {
 		"node": map[string]interface{}{
 			"key":           "/foo/bar",
 			"value":         "XXX",
-			"modifiedIndex": float64(4),
+			"modifiedIndex": float64(5),
 		},
 		"action": "set",
 	}
@@ -851,6 +945,7 @@ func TestV2WatchWithIndex(t *testing.T) {
 }
 
 func TestV2WatchKeyInDir(t *testing.T) {
+	defer testutil.AfterTest(t)
 	cl := NewCluster(t, 1)
 	cl.Launch(t)
 	defer cl.Terminate(t)
@@ -865,25 +960,37 @@ func TestV2WatchKeyInDir(t *testing.T) {
 	v := url.Values{}
 	v.Set("dir", "true")
 	v.Set("ttl", "1")
-	resp, _ := tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/keyindir"), v)
+	resp, err := tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/keyindir"), v)
+	if err != nil {
+		t.Fatalf("put err = %v, want nil", err)
+	}
 	resp.Body.Close()
 
 	// Create a permanent node within the directory
 	v = url.Values{}
 	v.Set("value", "XXX")
-	resp, _ = tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/keyindir/bar"), v)
+	resp, err = tc.PutForm(fmt.Sprintf("%s%s", u, "/v2/keys/keyindir/bar"), v)
+	if err != nil {
+		t.Fatalf("put err = %v, want nil", err)
+	}
 	resp.Body.Close()
 
 	go func() {
 		// Expect a notification when watching the node
-		resp, _ := tc.Get(fmt.Sprintf("%s%s", u, "/v2/keys/keyindir/bar?wait=true"))
+		resp, err := tc.Get(fmt.Sprintf("%s%s", u, "/v2/keys/keyindir/bar?wait=true"))
+		if err != nil {
+			t.Errorf("watch err = %v, want nil", err)
+		}
 		body = tc.ReadBodyJSON(resp)
 		c <- true
 	}()
 
 	select {
 	case <-c:
-	case <-time.After(time.Millisecond * 1500):
+	// 1s ttl + 0.5s sync delay + 1.5s disk and network delay
+	// We set that long disk and network delay because travis may be slow
+	// when do system calls.
+	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for watch result")
 	}
 
@@ -899,6 +1006,7 @@ func TestV2WatchKeyInDir(t *testing.T) {
 }
 
 func TestV2Head(t *testing.T) {
+	defer testutil.AfterTest(t)
 	cl := NewCluster(t, 1)
 	cl.Launch(t)
 	defer cl.Terminate(t)
@@ -909,7 +1017,10 @@ func TestV2Head(t *testing.T) {
 	v := url.Values{}
 	v.Set("value", "XXX")
 	fullURL := fmt.Sprintf("%s%s", u, "/v2/keys/foo/bar")
-	resp, _ := tc.Head(fullURL)
+	resp, err := tc.Head(fullURL)
+	if err != nil {
+		t.Fatalf("head err = %v, want nil", err)
+	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
@@ -918,10 +1029,16 @@ func TestV2Head(t *testing.T) {
 		t.Errorf("ContentLength = %d, want > 0", resp.ContentLength)
 	}
 
-	resp, _ = tc.PutForm(fullURL, v)
+	resp, err = tc.PutForm(fullURL, v)
+	if err != nil {
+		t.Fatalf("put err = %v, want nil", err)
+	}
 	resp.Body.Close()
 
-	resp, _ = tc.Head(fullURL)
+	resp, err = tc.Head(fullURL)
+	if err != nil {
+		t.Fatalf("head err = %v, want nil", err)
+	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
@@ -969,10 +1086,8 @@ type testHttpClient struct {
 
 // Creates a new HTTP client with KeepAlive disabled.
 func NewTestClient() *testHttpClient {
-	tr := &http.Transport{
-		Dial:              (&net.Dialer{Timeout: time.Second}).Dial,
-		DisableKeepAlives: true,
-	}
+	tr, _ := transport.NewTransport(transport.TLSInfo{}, time.Second)
+	tr.DisableKeepAlives = true
 	return &testHttpClient{&http.Client{Transport: tr}}
 }
 

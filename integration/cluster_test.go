@@ -1,65 +1,59 @@
-/*
-   Copyright 2014 CoreOS, Inc.
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-*/
+// Copyright 2015 The etcd Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package integration
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"math/rand"
-	"net"
-	"net/http"
-	"net/http/httptest"
 	"os"
-	"reflect"
-	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/coreos/etcd/client"
-	"github.com/coreos/etcd/etcdserver"
-	"github.com/coreos/etcd/etcdserver/etcdhttp"
-	"github.com/coreos/etcd/etcdserver/etcdhttp/httptypes"
-	"github.com/coreos/etcd/pkg/testutil"
-	"github.com/coreos/etcd/pkg/transport"
-	"github.com/coreos/etcd/pkg/types"
-	"github.com/coreos/etcd/rafthttp"
-
-	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
-)
-
-const (
-	tickDuration   = 10 * time.Millisecond
-	clusterName    = "etcd"
-	requestTimeout = 2 * time.Second
+	"go.etcd.io/etcd/client"
+	"go.etcd.io/etcd/etcdserver"
+	"go.etcd.io/etcd/pkg/testutil"
 )
 
 func init() {
 	// open microsecond-level time log for integration test debugging
 	log.SetFlags(log.Ltime | log.Lmicroseconds | log.Lshortfile)
+	if t := os.Getenv("ETCD_ELECTION_TIMEOUT_TICKS"); t != "" {
+		if i, err := strconv.ParseInt(t, 10, 64); err == nil {
+			electionTicks = int(i)
+		}
+	}
 }
 
 func TestClusterOf1(t *testing.T) { testCluster(t, 1) }
 func TestClusterOf3(t *testing.T) { testCluster(t, 3) }
 
 func testCluster(t *testing.T, size int) {
-	defer afterTest(t)
+	defer testutil.AfterTest(t)
 	c := NewCluster(t, size)
+	c.Launch(t)
+	defer c.Terminate(t)
+	clusterMustProgress(t, c.Members)
+}
+
+func TestTLSClusterOf3(t *testing.T) {
+	defer testutil.AfterTest(t)
+	c := NewClusterByConfig(t, &ClusterConfig{Size: 3, PeerTLS: &testTLSInfo})
 	c.Launch(t)
 	defer c.Terminate(t)
 	clusterMustProgress(t, c.Members)
@@ -69,20 +63,48 @@ func TestClusterOf1UsingDiscovery(t *testing.T) { testClusterUsingDiscovery(t, 1
 func TestClusterOf3UsingDiscovery(t *testing.T) { testClusterUsingDiscovery(t, 3) }
 
 func testClusterUsingDiscovery(t *testing.T, size int) {
-	defer afterTest(t)
+	defer testutil.AfterTest(t)
 	dc := NewCluster(t, 1)
 	dc.Launch(t)
 	defer dc.Terminate(t)
 	// init discovery token space
-	dcc := mustNewHTTPClient(t, dc.URLs())
+	dcc := MustNewHTTPClient(t, dc.URLs(), nil)
 	dkapi := client.NewKeysAPI(dcc)
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
-	if _, err := dkapi.Create(ctx, "/_config/size", fmt.Sprintf("%d", size), -1); err != nil {
+	if _, err := dkapi.Create(ctx, "/_config/size", fmt.Sprintf("%d", size)); err != nil {
 		t.Fatal(err)
 	}
 	cancel()
 
-	c := NewClusterByDiscovery(t, size, dc.URL(0)+"/v2/keys")
+	c := NewClusterByConfig(
+		t,
+		&ClusterConfig{Size: size, DiscoveryURL: dc.URL(0) + "/v2/keys"},
+	)
+	c.Launch(t)
+	defer c.Terminate(t)
+	clusterMustProgress(t, c.Members)
+}
+
+func TestTLSClusterOf3UsingDiscovery(t *testing.T) {
+	defer testutil.AfterTest(t)
+	dc := NewCluster(t, 1)
+	dc.Launch(t)
+	defer dc.Terminate(t)
+	// init discovery token space
+	dcc := MustNewHTTPClient(t, dc.URLs(), nil)
+	dkapi := client.NewKeysAPI(dcc)
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	if _, err := dkapi.Create(ctx, "/_config/size", fmt.Sprintf("%d", 3)); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+
+	c := NewClusterByConfig(t,
+		&ClusterConfig{
+			Size:         3,
+			PeerTLS:      &testTLSInfo,
+			DiscoveryURL: dc.URL(0) + "/v2/keys"},
+	)
 	c.Launch(t)
 	defer c.Terminate(t)
 	clusterMustProgress(t, c.Members)
@@ -92,7 +114,7 @@ func TestDoubleClusterSizeOf1(t *testing.T) { testDoubleClusterSize(t, 1) }
 func TestDoubleClusterSizeOf3(t *testing.T) { testDoubleClusterSize(t, 3) }
 
 func testDoubleClusterSize(t *testing.T, size int) {
-	defer afterTest(t)
+	defer testutil.AfterTest(t)
 	c := NewCluster(t, size)
 	c.Launch(t)
 	defer c.Terminate(t)
@@ -103,467 +125,426 @@ func testDoubleClusterSize(t *testing.T, size int) {
 	clusterMustProgress(t, c.Members)
 }
 
+func TestDoubleTLSClusterSizeOf3(t *testing.T) {
+	defer testutil.AfterTest(t)
+	c := NewClusterByConfig(t, &ClusterConfig{Size: 3, PeerTLS: &testTLSInfo})
+	c.Launch(t)
+	defer c.Terminate(t)
+
+	for i := 0; i < 3; i++ {
+		c.AddMember(t)
+	}
+	clusterMustProgress(t, c.Members)
+}
+
 func TestDecreaseClusterSizeOf3(t *testing.T) { testDecreaseClusterSize(t, 3) }
 func TestDecreaseClusterSizeOf5(t *testing.T) { testDecreaseClusterSize(t, 5) }
 
 func testDecreaseClusterSize(t *testing.T, size int) {
-	defer afterTest(t)
+	defer testutil.AfterTest(t)
 	c := NewCluster(t, size)
 	c.Launch(t)
 	defer c.Terminate(t)
 
 	// TODO: remove the last but one member
-	for i := 0; i < size-2; i++ {
+	for i := 0; i < size-1; i++ {
 		id := c.Members[len(c.Members)-1].s.ID()
-		c.RemoveMember(t, uint64(id))
+		// may hit second leader election on slow machines
+		if err := c.removeMember(t, uint64(id)); err != nil {
+			if strings.Contains(err.Error(), "no leader") {
+				t.Logf("got leader error (%v)", err)
+				i--
+				continue
+			}
+			t.Fatal(err)
+		}
 		c.waitLeader(t, c.Members)
 	}
 	clusterMustProgress(t, c.Members)
+}
+
+func TestForceNewCluster(t *testing.T) {
+	c := NewCluster(t, 3)
+	c.Launch(t)
+	cc := MustNewHTTPClient(t, []string{c.Members[0].URL()}, nil)
+	kapi := client.NewKeysAPI(cc)
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	resp, err := kapi.Create(ctx, "/foo", "bar")
+	if err != nil {
+		t.Fatalf("unexpected create error: %v", err)
+	}
+	cancel()
+	// ensure create has been applied in this machine
+	ctx, cancel = context.WithTimeout(context.Background(), requestTimeout)
+	if _, err = kapi.Watcher("/foo", &client.WatcherOptions{AfterIndex: resp.Node.ModifiedIndex - 1}).Next(ctx); err != nil {
+		t.Fatalf("unexpected watch error: %v", err)
+	}
+	cancel()
+
+	c.Members[0].Stop(t)
+	c.Members[1].Terminate(t)
+	c.Members[2].Terminate(t)
+	c.Members[0].ForceNewCluster = true
+	err = c.Members[0].Restart(t)
+	if err != nil {
+		t.Fatalf("unexpected ForceRestart error: %v", err)
+	}
+	defer c.Members[0].Terminate(t)
+	c.waitLeader(t, c.Members[:1])
+
+	// use new http client to init new connection
+	cc = MustNewHTTPClient(t, []string{c.Members[0].URL()}, nil)
+	kapi = client.NewKeysAPI(cc)
+	// ensure force restart keep the old data, and new cluster can make progress
+	ctx, cancel = context.WithTimeout(context.Background(), requestTimeout)
+	if _, err := kapi.Watcher("/foo", &client.WatcherOptions{AfterIndex: resp.Node.ModifiedIndex - 1}).Next(ctx); err != nil {
+		t.Fatalf("unexpected watch error: %v", err)
+	}
+	cancel()
+	clusterMustProgress(t, c.Members[:1])
+}
+
+func TestAddMemberAfterClusterFullRotation(t *testing.T) {
+	defer testutil.AfterTest(t)
+	c := NewCluster(t, 3)
+	c.Launch(t)
+	defer c.Terminate(t)
+
+	// remove all the previous three members and add in three new members.
+	for i := 0; i < 3; i++ {
+		c.RemoveMember(t, uint64(c.Members[0].s.ID()))
+		c.waitLeader(t, c.Members)
+
+		c.AddMember(t)
+		c.waitLeader(t, c.Members)
+	}
+
+	c.AddMember(t)
+	c.waitLeader(t, c.Members)
+
+	clusterMustProgress(t, c.Members)
+}
+
+// Ensure we can remove a member then add a new one back immediately.
+func TestIssue2681(t *testing.T) {
+	defer testutil.AfterTest(t)
+	c := NewCluster(t, 5)
+	c.Launch(t)
+	defer c.Terminate(t)
+
+	c.RemoveMember(t, uint64(c.Members[4].s.ID()))
+	c.waitLeader(t, c.Members)
+
+	c.AddMember(t)
+	c.waitLeader(t, c.Members)
+	clusterMustProgress(t, c.Members)
+}
+
+// Ensure we can remove a member after a snapshot then add a new one back.
+func TestIssue2746(t *testing.T) { testIssue2746(t, 5) }
+
+// With 3 nodes TestIssue2476 sometimes had a shutdown with an inflight snapshot.
+func TestIssue2746WithThree(t *testing.T) { testIssue2746(t, 3) }
+
+func testIssue2746(t *testing.T, members int) {
+	defer testutil.AfterTest(t)
+	c := NewCluster(t, members)
+
+	for _, m := range c.Members {
+		m.SnapshotCount = 10
+	}
+
+	c.Launch(t)
+	defer c.Terminate(t)
+
+	// force a snapshot
+	for i := 0; i < 20; i++ {
+		clusterMustProgress(t, c.Members)
+	}
+
+	c.RemoveMember(t, uint64(c.Members[members-1].s.ID()))
+	c.waitLeader(t, c.Members)
+
+	c.AddMember(t)
+	c.waitLeader(t, c.Members)
+	clusterMustProgress(t, c.Members)
+}
+
+// Ensure etcd will not panic when removing a just started member.
+func TestIssue2904(t *testing.T) {
+	defer testutil.AfterTest(t)
+	// start 1-member cluster to ensure member 0 is the leader of the cluster.
+	c := NewCluster(t, 1)
+	c.Launch(t)
+	defer c.Terminate(t)
+
+	c.AddMember(t)
+	c.Members[1].Stop(t)
+
+	// send remove member-1 request to the cluster.
+	cc := MustNewHTTPClient(t, c.URLs(), nil)
+	ma := client.NewMembersAPI(cc)
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	// the proposal is not committed because member 1 is stopped, but the
+	// proposal is appended to leader's raft log.
+	ma.Remove(ctx, c.Members[1].s.ID().String())
+	cancel()
+
+	// restart member, and expect it to send UpdateAttributes request.
+	// the log in the leader is like this:
+	// [..., remove 1, ..., update attr 1, ...]
+	c.Members[1].Restart(t)
+	// when the member comes back, it ack the proposal to remove itself,
+	// and apply it.
+	<-c.Members[1].s.StopNotify()
+
+	// terminate removed member
+	c.Members[1].Terminate(t)
+	c.Members = c.Members[:1]
+	// wait member to be removed.
+	c.waitMembersMatch(t, c.HTTPMembers())
+}
+
+// TestIssue3699 tests minority failure during cluster configuration; it was
+// deadlocking.
+func TestIssue3699(t *testing.T) {
+	// start a cluster of 3 nodes a, b, c
+	defer testutil.AfterTest(t)
+	c := NewCluster(t, 3)
+	c.Launch(t)
+	defer c.Terminate(t)
+
+	// make node a unavailable
+	c.Members[0].Stop(t)
+
+	// add node d
+	c.AddMember(t)
+
+	// electing node d as leader makes node a unable to participate
+	leaderID := c.waitLeader(t, c.Members)
+	for leaderID != 3 {
+		c.Members[leaderID].Stop(t)
+		<-c.Members[leaderID].s.StopNotify()
+		// do not restart the killed member immediately.
+		// the member will advance its election timeout after restart,
+		// so it will have a better chance to become the leader again.
+		time.Sleep(time.Duration(electionTicks * int(tickDuration)))
+		c.Members[leaderID].Restart(t)
+		leaderID = c.waitLeader(t, c.Members)
+	}
+
+	// bring back node a
+	// node a will remain useless as long as d is the leader.
+	if err := c.Members[0].Restart(t); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	// waiting for ReadyNotify can take several seconds
+	case <-time.After(10 * time.Second):
+		t.Fatalf("waited too long for ready notification")
+	case <-c.Members[0].s.StopNotify():
+		t.Fatalf("should not be stopped")
+	case <-c.Members[0].s.ReadyNotify():
+	}
+	// must waitLeader so goroutines don't leak on terminate
+	c.waitLeader(t, c.Members)
+
+	// try to participate in cluster
+	cc := MustNewHTTPClient(t, []string{c.URL(0)}, c.cfg.ClientTLS)
+	kapi := client.NewKeysAPI(cc)
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	if _, err := kapi.Set(ctx, "/foo", "bar", nil); err != nil {
+		t.Fatalf("unexpected error on Set (%v)", err)
+	}
+	cancel()
+}
+
+// TestRejectUnhealthyAdd ensures an unhealthy cluster rejects adding members.
+func TestRejectUnhealthyAdd(t *testing.T) {
+	defer testutil.AfterTest(t)
+	c := NewCluster(t, 3)
+	for _, m := range c.Members {
+		m.ServerConfig.StrictReconfigCheck = true
+	}
+	c.Launch(t)
+	defer c.Terminate(t)
+
+	// make cluster unhealthy and wait for downed peer
+	c.Members[0].Stop(t)
+	c.WaitLeader(t)
+
+	// all attempts to add member should fail
+	for i := 1; i < len(c.Members); i++ {
+		err := c.addMemberByURL(t, c.URL(i), "unix://foo:12345")
+		if err == nil {
+			t.Fatalf("should have failed adding peer")
+		}
+		// TODO: client should return descriptive error codes for internal errors
+		if !strings.Contains(err.Error(), "has no leader") {
+			t.Errorf("unexpected error (%v)", err)
+		}
+	}
+
+	// make cluster healthy
+	c.Members[0].Restart(t)
+	c.WaitLeader(t)
+	time.Sleep(2 * etcdserver.HealthInterval)
+
+	// add member should succeed now that it's healthy
+	var err error
+	for i := 1; i < len(c.Members); i++ {
+		if err = c.addMemberByURL(t, c.URL(i), "unix://foo:12345"); err == nil {
+			break
+		}
+	}
+	if err != nil {
+		t.Fatalf("should have added peer to healthy cluster (%v)", err)
+	}
+}
+
+// TestRejectUnhealthyRemove ensures an unhealthy cluster rejects removing members
+// if quorum will be lost.
+func TestRejectUnhealthyRemove(t *testing.T) {
+	defer testutil.AfterTest(t)
+	c := NewCluster(t, 5)
+	for _, m := range c.Members {
+		m.ServerConfig.StrictReconfigCheck = true
+	}
+	c.Launch(t)
+	defer c.Terminate(t)
+
+	// make cluster unhealthy and wait for downed peer; (3 up, 2 down)
+	c.Members[0].Stop(t)
+	c.Members[1].Stop(t)
+	c.WaitLeader(t)
+
+	// reject remove active member since (3,2)-(1,0) => (2,2) lacks quorum
+	err := c.removeMember(t, uint64(c.Members[2].s.ID()))
+	if err == nil {
+		t.Fatalf("should reject quorum breaking remove")
+	}
+	// TODO: client should return more descriptive error codes for internal errors
+	if !strings.Contains(err.Error(), "has no leader") {
+		t.Errorf("unexpected error (%v)", err)
+	}
+
+	// member stopped after launch; wait for missing heartbeats
+	time.Sleep(time.Duration(electionTicks * int(tickDuration)))
+
+	// permit remove dead member since (3,2) - (0,1) => (3,1) has quorum
+	if err = c.removeMember(t, uint64(c.Members[0].s.ID())); err != nil {
+		t.Fatalf("should accept removing down member")
+	}
+
+	// bring cluster to (4,1)
+	c.Members[0].Restart(t)
+
+	// restarted member must be connected for a HealthInterval before remove is accepted
+	time.Sleep((3 * etcdserver.HealthInterval) / 2)
+
+	// accept remove member since (4,1)-(1,0) => (3,1) has quorum
+	if err = c.removeMember(t, uint64(c.Members[0].s.ID())); err != nil {
+		t.Fatalf("expected to remove member, got error %v", err)
+	}
+}
+
+// TestRestartRemoved ensures that restarting removed member must exit
+// if 'initial-cluster-state' is set 'new' and old data directory still exists
+// (see https://github.com/etcd-io/etcd/issues/7512 for more).
+func TestRestartRemoved(t *testing.T) {
+	defer testutil.AfterTest(t)
+
+	// 1. start single-member cluster
+	c := NewCluster(t, 1)
+	for _, m := range c.Members {
+		m.ServerConfig.StrictReconfigCheck = true
+	}
+	c.Launch(t)
+	defer c.Terminate(t)
+
+	// 2. add a new member
+	c.AddMember(t)
+	c.WaitLeader(t)
+
+	oldm := c.Members[0]
+	oldm.keepDataDirTerminate = true
+
+	// 3. remove first member, shut down without deleting data
+	if err := c.removeMember(t, uint64(c.Members[0].s.ID())); err != nil {
+		t.Fatalf("expected to remove member, got error %v", err)
+	}
+	c.WaitLeader(t)
+
+	// 4. restart first member with 'initial-cluster-state=new'
+	// wrong config, expects exit within ReqTimeout
+	oldm.ServerConfig.NewCluster = false
+	if err := oldm.Restart(t); err != nil {
+		t.Fatalf("unexpected ForceRestart error: %v", err)
+	}
+	defer func() {
+		oldm.Close()
+		os.RemoveAll(oldm.ServerConfig.DataDir)
+	}()
+	select {
+	case <-oldm.s.StopNotify():
+	case <-time.After(time.Minute):
+		t.Fatalf("removed member didn't exit within %v", time.Minute)
+	}
 }
 
 // clusterMustProgress ensures that cluster can make progress. It creates
 // a random key first, and check the new key could be got from all client urls
 // of the cluster.
 func clusterMustProgress(t *testing.T, membs []*member) {
-	cc := mustNewHTTPClient(t, []string{membs[0].URL()})
+	cc := MustNewHTTPClient(t, []string{membs[0].URL()}, nil)
 	kapi := client.NewKeysAPI(cc)
-	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	key := fmt.Sprintf("foo%d", rand.Int())
-	resp, err := kapi.Create(ctx, "/"+key, "bar", -1)
-	if err != nil {
-		t.Fatalf("create on %s error: %v", membs[0].URL(), err)
-	}
-	cancel()
-
-	for i, m := range membs {
-		u := m.URL()
-		cc := mustNewHTTPClient(t, []string{u})
-		kapi := client.NewKeysAPI(cc)
+	var (
+		err  error
+		resp *client.Response
+	)
+	// retry in case of leader loss induced by slow CI
+	for i := 0; i < 3; i++ {
 		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
-		if _, err := kapi.Watch(key, resp.Node.ModifiedIndex).Next(ctx); err != nil {
-			t.Fatalf("#%d: watch on %s error: %v", i, u, err)
-		}
+		resp, err = kapi.Create(ctx, "/"+key, "bar")
 		cancel()
-	}
-}
-
-// TODO: support TLS
-type cluster struct {
-	Members []*member
-}
-
-func fillClusterForMembers(ms []*member, cName string) error {
-	addrs := make([]string, 0)
-	for _, m := range ms {
-		for _, l := range m.PeerListeners {
-			addrs = append(addrs, fmt.Sprintf("%s=%s", m.Name, "http://"+l.Addr().String()))
-		}
-	}
-	clusterStr := strings.Join(addrs, ",")
-	var err error
-	for _, m := range ms {
-		m.Cluster, err = etcdserver.NewClusterFromString(cName, clusterStr)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// NewCluster returns an unlaunched cluster of the given size which has been
-// set to use static bootstrap.
-func NewCluster(t *testing.T, size int) *cluster {
-	c := &cluster{}
-	ms := make([]*member, size)
-	for i := 0; i < size; i++ {
-		ms[i] = mustNewMember(t, c.name(i))
-	}
-	c.Members = ms
-	if err := fillClusterForMembers(c.Members, clusterName); err != nil {
-		t.Fatal(err)
-	}
-
-	return c
-}
-
-// NewClusterUsingDiscovery returns an unlaunched cluster of the given size
-// which has been set to use the given url as discovery service to bootstrap.
-func NewClusterByDiscovery(t *testing.T, size int, url string) *cluster {
-	c := &cluster{}
-	ms := make([]*member, size)
-	for i := 0; i < size; i++ {
-		ms[i] = mustNewMember(t, c.name(i))
-		ms[i].DiscoveryURL = url
-	}
-	c.Members = ms
-	return c
-}
-
-func (c *cluster) Launch(t *testing.T) {
-	errc := make(chan error)
-	for _, m := range c.Members {
-		// Members are launched in separate goroutines because if they boot
-		// using discovery url, they have to wait for others to register to continue.
-		go func(m *member) {
-			errc <- m.Launch()
-		}(m)
-	}
-	for _ = range c.Members {
-		if err := <-errc; err != nil {
-			t.Fatalf("error setting up member: %v", err)
-		}
-	}
-	// wait cluster to be stable to receive future client requests
-	c.waitMembersMatch(t, c.HTTPMembers())
-}
-
-func (c *cluster) URL(i int) string {
-	return c.Members[i].ClientURLs[0].String()
-}
-
-func (c *cluster) URLs() []string {
-	urls := make([]string, 0)
-	for _, m := range c.Members {
-		for _, u := range m.ClientURLs {
-			urls = append(urls, u.String())
-		}
-	}
-	return urls
-}
-
-func (c *cluster) HTTPMembers() []httptypes.Member {
-	ms := make([]httptypes.Member, len(c.Members))
-	for i, m := range c.Members {
-		ms[i].Name = m.Name
-		for _, ln := range m.PeerListeners {
-			ms[i].PeerURLs = append(ms[i].PeerURLs, "http://"+ln.Addr().String())
-		}
-		for _, ln := range m.ClientListeners {
-			ms[i].ClientURLs = append(ms[i].ClientURLs, "http://"+ln.Addr().String())
-		}
-	}
-	return ms
-}
-
-func (c *cluster) AddMember(t *testing.T) {
-	clusterStr := c.Members[0].Cluster.String()
-	idx := len(c.Members)
-	m := mustNewMember(t, c.name(idx))
-
-	// send add request to the cluster
-	cc := mustNewHTTPClient(t, []string{c.URL(0)})
-	ma := client.NewMembersAPI(cc)
-	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
-	peerURL := "http://" + m.PeerListeners[0].Addr().String()
-	if _, err := ma.Add(ctx, peerURL); err != nil {
-		t.Fatalf("add member on %s error: %v", c.URL(0), err)
-	}
-	cancel()
-
-	// wait for the add node entry applied in the cluster
-	members := append(c.HTTPMembers(), httptypes.Member{PeerURLs: []string{peerURL}, ClientURLs: []string{}})
-	c.waitMembersMatch(t, members)
-
-	for _, ln := range m.PeerListeners {
-		clusterStr += fmt.Sprintf(",%s=http://%s", m.Name, ln.Addr().String())
-	}
-	var err error
-	m.Cluster, err = etcdserver.NewClusterFromString(clusterName, clusterStr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	m.NewCluster = false
-	if err := m.Launch(); err != nil {
-		t.Fatal(err)
-	}
-	c.Members = append(c.Members, m)
-	// wait cluster to be stable to receive future client requests
-	c.waitMembersMatch(t, c.HTTPMembers())
-}
-
-func (c *cluster) RemoveMember(t *testing.T, id uint64) {
-	// send remove request to the cluster
-	cc := mustNewHTTPClient(t, []string{c.URL(0)})
-	ma := client.NewMembersAPI(cc)
-	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
-	if err := ma.Remove(ctx, types.ID(id).String()); err != nil {
-		t.Fatalf("unexpected remove error %v", err)
-	}
-	cancel()
-	newMembers := make([]*member, 0)
-	for _, m := range c.Members {
-		if uint64(m.s.ID()) != id {
-			newMembers = append(newMembers, m)
-		} else {
-			select {
-			case <-m.s.StopNotify():
-				m.Terminate(t)
-			case <-time.After(time.Second):
-				t.Fatalf("failed to remove member %s in one second", m.s.ID())
-			}
-		}
-	}
-	c.Members = newMembers
-	c.waitMembersMatch(t, c.HTTPMembers())
-}
-
-func (c *cluster) Terminate(t *testing.T) {
-	for _, m := range c.Members {
-		m.Terminate(t)
-	}
-}
-
-func (c *cluster) waitMembersMatch(t *testing.T, membs []httptypes.Member) {
-	for _, u := range c.URLs() {
-		cc := mustNewHTTPClient(t, []string{u})
-		ma := client.NewMembersAPI(cc)
-		for {
-			ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
-			ms, err := ma.List(ctx)
-			cancel()
-			if err == nil && isMembersEqual(ms, membs) {
-				break
-			}
-			time.Sleep(tickDuration)
-		}
-	}
-	return
-}
-
-func (c *cluster) waitLeader(t *testing.T, membs []*member) {
-	possibleLead := make(map[uint64]bool)
-	var lead uint64
-	for _, m := range membs {
-		possibleLead[uint64(m.s.ID())] = true
-	}
-
-	for lead == 0 || !possibleLead[lead] {
-		lead = 0
-		for _, m := range membs {
-			if lead != 0 && lead != m.s.Lead() {
-				lead = 0
-				break
-			}
-			lead = m.s.Lead()
-		}
-		time.Sleep(10 * tickDuration)
-	}
-}
-
-func (c *cluster) name(i int) string {
-	return fmt.Sprint("node", i)
-}
-
-// isMembersEqual checks whether two members equal except ID field.
-// The given wmembs should always set ID field to empty string.
-func isMembersEqual(membs []httptypes.Member, wmembs []httptypes.Member) bool {
-	sort.Sort(SortableMemberSliceByPeerURLs(membs))
-	sort.Sort(SortableMemberSliceByPeerURLs(wmembs))
-	for i := range membs {
-		membs[i].ID = ""
-	}
-	return reflect.DeepEqual(membs, wmembs)
-}
-
-func newLocalListener(t *testing.T) net.Listener {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return l
-}
-
-func newListenerWithAddr(t *testing.T, addr string) net.Listener {
-	var err error
-	var l net.Listener
-	// TODO: we want to reuse a previous closed port immediately.
-	// a better way is to set SO_REUSExx instead of doing retry.
-	for i := 0; i < 5; i++ {
-		l, err = net.Listen("tcp", addr)
 		if err == nil {
 			break
 		}
-		time.Sleep(500 * time.Millisecond)
+		t.Logf("failed to create key on %q (%v)", membs[0].URL(), err)
 	}
 	if err != nil {
-		t.Fatal(err)
-	}
-	return l
-}
-
-type member struct {
-	etcdserver.ServerConfig
-	PeerListeners, ClientListeners []net.Listener
-
-	raftHandler *testutil.PauseableHandler
-	s           *etcdserver.EtcdServer
-	hss         []*httptest.Server
-}
-
-func mustNewMember(t *testing.T, name string) *member {
-	var err error
-	m := &member{}
-
-	pln := newLocalListener(t)
-	m.PeerListeners = []net.Listener{pln}
-	m.PeerURLs, err = types.NewURLs([]string{"http://" + pln.Addr().String()})
-	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("create on %s error: %v", membs[0].URL(), err)
 	}
 
-	cln := newLocalListener(t)
-	m.ClientListeners = []net.Listener{cln}
-	m.ClientURLs, err = types.NewURLs([]string{"http://" + cln.Addr().String()})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	m.Name = name
-
-	m.DataDir, err = ioutil.TempDir(os.TempDir(), "etcd")
-	if err != nil {
-		t.Fatal(err)
-	}
-	clusterStr := fmt.Sprintf("%s=http://%s", name, pln.Addr().String())
-	m.Cluster, err = etcdserver.NewClusterFromString(clusterName, clusterStr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	m.NewCluster = true
-	m.Transport = mustNewTransport(t)
-	return m
-}
-
-// Clone returns a member with the same server configuration. The returned
-// member will not set PeerListeners and ClientListeners.
-func (m *member) Clone(t *testing.T) *member {
-	mm := &member{}
-	mm.ServerConfig = m.ServerConfig
-
-	var err error
-	clientURLStrs := m.ClientURLs.StringSlice()
-	mm.ClientURLs, err = types.NewURLs(clientURLStrs)
-	if err != nil {
-		// this should never fail
-		panic(err)
-	}
-	peerURLStrs := m.PeerURLs.StringSlice()
-	mm.PeerURLs, err = types.NewURLs(peerURLStrs)
-	if err != nil {
-		// this should never fail
-		panic(err)
-	}
-	clusterStr := m.Cluster.String()
-	mm.Cluster, err = etcdserver.NewClusterFromString(clusterName, clusterStr)
-	if err != nil {
-		// this should never fail
-		panic(err)
-	}
-	mm.Transport = mustNewTransport(t)
-	return mm
-}
-
-// Launch starts a member based on ServerConfig, PeerListeners
-// and ClientListeners.
-func (m *member) Launch() error {
-	var err error
-	if m.s, err = etcdserver.NewServer(&m.ServerConfig); err != nil {
-		return fmt.Errorf("failed to initialize the etcd server: %v", err)
-	}
-	m.s.Ticker = time.Tick(tickDuration)
-	m.s.SyncTicker = time.Tick(500 * time.Millisecond)
-	m.s.Start()
-
-	m.raftHandler = &testutil.PauseableHandler{Next: etcdhttp.NewPeerHandler(m.s)}
-
-	for _, ln := range m.PeerListeners {
-		hs := &httptest.Server{
-			Listener: ln,
-			Config:   &http.Server{Handler: m.raftHandler},
+	for i, m := range membs {
+		u := m.URL()
+		mcc := MustNewHTTPClient(t, []string{u}, nil)
+		mkapi := client.NewKeysAPI(mcc)
+		mctx, mcancel := context.WithTimeout(context.Background(), requestTimeout)
+		if _, err := mkapi.Watcher(key, &client.WatcherOptions{AfterIndex: resp.Node.ModifiedIndex - 1}).Next(mctx); err != nil {
+			t.Fatalf("#%d: watch on %s error: %v", i, u, err)
 		}
-		hs.Start()
-		m.hss = append(m.hss, hs)
-	}
-	for _, ln := range m.ClientListeners {
-		hs := &httptest.Server{
-			Listener: ln,
-			Config:   &http.Server{Handler: etcdhttp.NewClientHandler(m.s)},
-		}
-		hs.Start()
-		m.hss = append(m.hss, hs)
-	}
-	return nil
-}
-
-func (m *member) URL() string { return m.ClientURLs[0].String() }
-
-func (m *member) Pause() {
-	m.raftHandler.Pause()
-	m.s.PauseSending()
-}
-
-func (m *member) Resume() {
-	m.raftHandler.Resume()
-	m.s.ResumeSending()
-}
-
-// Stop stops the member, but the data dir of the member is preserved.
-func (m *member) Stop(t *testing.T) {
-	m.s.Stop()
-	for _, hs := range m.hss {
-		hs.CloseClientConnections()
-		hs.Close()
-	}
-	m.hss = nil
-}
-
-// Start starts the member using the preserved data dir.
-func (m *member) Restart(t *testing.T) error {
-	newPeerListeners := make([]net.Listener, 0)
-	for _, ln := range m.PeerListeners {
-		newPeerListeners = append(newPeerListeners, newListenerWithAddr(t, ln.Addr().String()))
-	}
-	m.PeerListeners = newPeerListeners
-	newClientListeners := make([]net.Listener, 0)
-	for _, ln := range m.ClientListeners {
-		newClientListeners = append(newClientListeners, newListenerWithAddr(t, ln.Addr().String()))
-	}
-	m.ClientListeners = newClientListeners
-	return m.Launch()
-}
-
-// Terminate stops the member and removes the data dir.
-func (m *member) Terminate(t *testing.T) {
-	m.s.Stop()
-	for _, hs := range m.hss {
-		hs.CloseClientConnections()
-		hs.Close()
-	}
-	if err := os.RemoveAll(m.ServerConfig.DataDir); err != nil {
-		t.Fatal(err)
+		mcancel()
 	}
 }
 
-func mustNewHTTPClient(t *testing.T, eps []string) client.HTTPClient {
-	cc, err := client.NewHTTPClient(mustNewTransport(t), eps)
-	if err != nil {
-		t.Fatal(err)
+func TestSpeedyTerminate(t *testing.T) {
+	defer testutil.AfterTest(t)
+	clus := NewClusterV3(t, &ClusterConfig{Size: 3})
+	// Stop/Restart so requests will time out on lost leaders
+	for i := 0; i < 3; i++ {
+		clus.Members[i].Stop(t)
+		clus.Members[i].Restart(t)
 	}
-	return cc
-}
-
-func mustNewTransport(t *testing.T) *http.Transport {
-	tr, err := transport.NewTimeoutTransport(transport.TLSInfo{}, rafthttp.ConnReadTimeout, rafthttp.ConnWriteTimeout)
-	if err != nil {
-		t.Fatal(err)
+	donec := make(chan struct{})
+	go func() {
+		defer close(donec)
+		clus.Terminate(t)
+	}()
+	select {
+	case <-time.After(10 * time.Second):
+		t.Fatalf("cluster took too long to terminate")
+	case <-donec:
 	}
-	return tr
 }
-
-type SortableMemberSliceByPeerURLs []httptypes.Member
-
-func (p SortableMemberSliceByPeerURLs) Len() int { return len(p) }
-func (p SortableMemberSliceByPeerURLs) Less(i, j int) bool {
-	return p[i].PeerURLs[0] < p[j].PeerURLs[0]
-}
-func (p SortableMemberSliceByPeerURLs) Swap(i, j int) { p[i], p[j] = p[j], p[i] }
